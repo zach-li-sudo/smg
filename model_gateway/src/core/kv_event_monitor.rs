@@ -10,7 +10,7 @@
 //! - `on_worker_removed` — aborts task, removes worker from indexer
 //! - `stop` — aborts all tasks, clears state
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use kv_index::{compute_content_hash, ApplyError, PositionalIndexer, SequenceHash, StoredBlock};
@@ -20,7 +20,7 @@ use smg_grpc_client::common_proto::{
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, info, warn};
 
-use crate::core::{ConnectionMode, Worker};
+use crate::core::{ConnectionMode, Worker, UNKNOWN_MODEL_ID};
 
 /// Default jump size for new `PositionalIndexer` instances.
 const DEFAULT_JUMP_SIZE: usize = 64;
@@ -38,7 +38,10 @@ const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 /// (one per `model_id`). Workers serving the same model share the same indexer.
 pub struct KvEventMonitor {
     /// Per-model positional indexers: model_id → shared indexer.
-    indexers: DashMap<String, Arc<PositionalIndexer>>,
+    pub(crate) indexers: DashMap<String, Arc<PositionalIndexer>>,
+    /// Per-model block sizes learned from KV events or set via WorkerSpec.
+    /// Used by CacheAwarePolicy to chunk request tokens at query time.
+    block_sizes: DashMap<String, usize>,
     /// Per-worker subscription handles: worker_url → subscription info.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove.
     worker_handles: Mutex<HashMap<String, WorkerSubscription>>,
@@ -71,6 +74,7 @@ impl KvEventMonitor {
         let jump_size = jump_size.unwrap_or(DEFAULT_JUMP_SIZE).max(1);
         Self {
             indexers: DashMap::new(),
+            block_sizes: DashMap::new(),
             worker_handles: Mutex::new(HashMap::new()),
             jump_size,
         }
@@ -83,7 +87,8 @@ impl KvEventMonitor {
     /// Duplicate calls for the same worker URL are no-ops.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url().to_string();
-        let model_id = worker.model_id().to_string();
+        // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
+        let model_id = Self::normalize_model_id(worker.model_id());
 
         if *worker.connection_mode() == ConnectionMode::Http {
             debug!(worker_url = %url, "HTTP worker, skipping KV event subscription");
@@ -101,6 +106,15 @@ impl KvEventMonitor {
             .entry(model_id.clone())
             .or_insert_with(|| Arc::new(PositionalIndexer::new(self.jump_size)))
             .clone();
+
+        // Seed block_size from WorkerSpec if set, valid, and not already known.
+        if let Some(bs) = worker.metadata().spec.kv_block_size {
+            if bs > 0 {
+                self.block_sizes.entry(model_id.clone()).or_insert(bs);
+            } else {
+                warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
+            }
+        }
 
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
@@ -125,15 +139,10 @@ impl KvEventMonitor {
 
     /// Stop the KV event subscription for a worker and remove it from the indexer.
     pub async fn on_worker_removed(&self, worker_url: &str) {
-        // Single lock acquisition: remove subscription and check remaining atomically
-        // to avoid TOCTOU race with concurrent on_worker_added for the same model.
-        let (subscription, should_remove_indexer) = {
+        // Remove subscription from handles under lock.
+        let subscription = {
             let mut handles = self.worker_handles.lock().await;
-            let sub = handles.remove(worker_url);
-            let should_remove = sub
-                .as_ref()
-                .is_some_and(|s| !handles.values().any(|other| other.model_id == s.model_id));
-            (sub, should_remove)
+            handles.remove(worker_url)
         };
 
         let Some(sub) = subscription else {
@@ -149,8 +158,18 @@ impl KvEventMonitor {
             indexer.remove_worker(worker_url);
         }
 
+        // Re-check under lock whether this was the last worker for the model.
+        // Must re-acquire lock after abort to avoid TOCTOU with concurrent
+        // on_worker_added that may have added a new worker for the same model
+        // between our first lock release and this point.
+        let should_remove_indexer = {
+            let handles = self.worker_handles.lock().await;
+            !handles.values().any(|other| other.model_id == sub.model_id)
+        };
+
         if should_remove_indexer {
             self.indexers.remove(&sub.model_id);
+            self.block_sizes.remove(&sub.model_id);
         }
     }
 
@@ -161,21 +180,20 @@ impl KvEventMonitor {
             std::mem::take(&mut *handles)
         };
 
-        if subscriptions.is_empty() {
-            return;
-        }
-
-        info!(
-            count = subscriptions.len(),
-            "Stopping all KV event subscriptions"
-        );
-        for (url, sub) in subscriptions {
-            debug!(worker_url = %url, "Aborting KV event subscription");
-            sub.handle.abort();
-            let _ = sub.handle.await;
+        if !subscriptions.is_empty() {
+            info!(
+                count = subscriptions.len(),
+                "Stopping all KV event subscriptions"
+            );
+            for (url, sub) in subscriptions {
+                debug!(worker_url = %url, "Aborting KV event subscription");
+                sub.handle.abort();
+                let _ = sub.handle.await;
+            }
         }
 
         self.indexers.clear();
+        self.block_sizes.clear();
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
@@ -183,9 +201,32 @@ impl KvEventMonitor {
         self.indexers.get(model_id).map(|r| Arc::clone(&r))
     }
 
+    /// Get the block size for a model (learned from events or set via `set_block_size`).
+    pub fn block_size(&self, model_id: &str) -> Option<usize> {
+        self.block_sizes.get(model_id).map(|v| *v)
+    }
+
+    /// Set the block size for a model (e.g. from WorkerSpec during registration).
+    /// Does not overwrite a value already learned from events.
+    pub fn set_block_size(&self, model_id: &str, block_size: usize) {
+        self.block_sizes
+            .entry(model_id.to_string())
+            .or_insert(block_size);
+    }
+
     /// Check if any subscription is running.
     pub async fn is_running(&self) -> bool {
         !self.worker_handles.lock().await.is_empty()
+    }
+
+    /// Normalize model_id to match routing's `normalize_model_key`.
+    /// Empty model IDs map to UNKNOWN_MODEL_ID for consistent keying.
+    fn normalize_model_id(model_id: &str) -> String {
+        if model_id.is_empty() {
+            UNKNOWN_MODEL_ID.to_string()
+        } else {
+            model_id.to_string()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -405,6 +446,16 @@ impl Drop for KvEventMonitor {
                 sub.handle.abort();
             }
         }
+    }
+}
+
+impl fmt::Debug for KvEventMonitor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvEventMonitor")
+            .field("models", &self.indexers.len())
+            .field("block_sizes", &self.block_sizes.len())
+            .field("jump_size", &self.jump_size)
+            .finish()
     }
 }
 
@@ -724,5 +775,35 @@ mod tests {
     async fn test_on_worker_removed_nonexistent() {
         let monitor = KvEventMonitor::new(None);
         monitor.on_worker_removed("http://nonexistent:8000").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // block_size learning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_block_size() {
+        let monitor = KvEventMonitor::new(None);
+
+        // Initially no block_size
+        assert!(monitor.block_size("llama").is_none());
+
+        // Set it
+        monitor.set_block_size("llama", 32);
+        assert_eq!(monitor.block_size("llama"), Some(32));
+
+        // set_block_size doesn't overwrite existing value
+        monitor.set_block_size("llama", 64);
+        assert_eq!(monitor.block_size("llama"), Some(32));
+    }
+
+    #[tokio::test]
+    async fn test_stop_clears_block_sizes() {
+        let monitor = KvEventMonitor::new(None);
+        monitor.set_block_size("llama", 16);
+        assert_eq!(monitor.block_size("llama"), Some(16));
+
+        monitor.stop().await;
+        assert!(monitor.block_size("llama").is_none());
     }
 }
