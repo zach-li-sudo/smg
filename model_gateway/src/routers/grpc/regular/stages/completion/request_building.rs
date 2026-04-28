@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::completion::CompletionRequest;
 use tracing::error;
 use uuid::Uuid;
 
@@ -19,6 +20,7 @@ use crate::routers::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext},
         proto_wrapper::ProtoRequest,
+        utils::stop_strings_to_token_ids,
     },
 };
 
@@ -63,10 +65,32 @@ impl PipelineStage for CompletionRequestBuildingStage {
 
         let request_id = format!("cmpl_{}", Uuid::now_v7());
 
+        // For MLX: pre-tokenize string stop sequences into stop_token_ids.
+        let mlx_modified: Option<CompletionRequest> = if builder_client.is_mlx() {
+            completion_request
+                .stop
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .and_then(|stop| ctx.state.tokenizer.as_deref().map(|tok| (stop, tok)))
+                .map(|(stop, tok)| {
+                    let extra_ids = stop_strings_to_token_ids(stop, tok);
+                    let mut req = (*completion_request).clone();
+                    let mut merged = req.stop_token_ids.take().unwrap_or_default();
+                    merged.extend(extra_ids);
+                    req.stop = None;
+                    req.stop_token_ids = if merged.is_empty() { None } else { Some(merged) };
+                    req
+                })
+        } else {
+            None
+        };
+        let completion_request_body: &CompletionRequest =
+            mlx_modified.as_ref().map_or(&*completion_request, |r| r);
+
         let mut proto_request = builder_client
             .build_completion_request(
                 request_id,
-                &completion_request,
+                completion_request_body,
                 prep.routing_text().unwrap_or_default().to_string(),
                 prep.token_ids().to_vec(),
             )

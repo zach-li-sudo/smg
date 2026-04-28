@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::generate::GenerateRequest;
 use tracing::error;
 use uuid::Uuid;
 
@@ -11,6 +12,7 @@ use crate::routers::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext},
         proto_wrapper::ProtoRequest,
+        utils::stop_strings_to_token_ids,
     },
 };
 
@@ -63,11 +65,37 @@ impl PipelineStage for GenerateRequestBuildingStage {
             .clone()
             .unwrap_or_else(|| format!("gen-{}", Uuid::now_v7()));
 
+        // For MLX: pre-tokenize string stop sequences in sampling_params into stop_token_ids.
+        let mlx_modified: Option<GenerateRequest> = if builder_client.is_mlx() {
+            generate_request
+                .sampling_params
+                .as_ref()
+                .and_then(|sp| sp.stop.as_ref().filter(|s| !s.is_empty()).map(|s| (s, sp)))
+                .and_then(|(stop, _sp)| {
+                    ctx.state.tokenizer.as_deref().map(|tok| (stop, tok))
+                })
+                .map(|(stop, tok)| {
+                    let extra_ids = stop_strings_to_token_ids(stop, tok);
+                    let mut req = (*generate_request).clone();
+                    if let Some(sp) = req.sampling_params.as_mut() {
+                        let mut merged = sp.stop_token_ids.take().unwrap_or_default();
+                        merged.extend(extra_ids);
+                        sp.stop = None;
+                        sp.stop_token_ids = if merged.is_empty() { None } else { Some(merged) };
+                    }
+                    req
+                })
+        } else {
+            None
+        };
+        let generate_request_body: &GenerateRequest =
+            mlx_modified.as_ref().map_or(&*generate_request, |r| r);
+
         // Build proto request using centralized dispatch
         let mut proto_request = builder_client
             .build_generate_request(
                 request_id,
-                &generate_request,
+                generate_request_body,
                 prep.routing_text().map(String::from),
                 prep.token_ids().to_vec(),
             )

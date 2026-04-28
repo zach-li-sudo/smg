@@ -5,6 +5,8 @@ use axum::response::Response;
 use tracing::error;
 use uuid::Uuid;
 
+use openai_protocol::chat::ChatCompletionRequest;
+
 use crate::routers::{
     error,
     grpc::{
@@ -12,6 +14,7 @@ use crate::routers::{
         context::{ClientSelection, PreparationOutput, RequestContext},
         multimodal::assemble_multimodal_data,
         proto_wrapper::ProtoRequest,
+        utils::stop_strings_to_token_ids,
     },
 };
 
@@ -75,6 +78,30 @@ impl PipelineStage for ChatRequestBuildingStage {
         // Build chat request
         let request_id = format!("chatcmpl-{}", Uuid::now_v7());
 
+        // For MLX: string stop sequences are pre-tokenized into stop_token_ids because
+        // the MLX proto only supports token-ID stops, not string stops.
+        // Other backends receive string stops natively through body.stop.
+        let mlx_modified: Option<ChatCompletionRequest> = if builder_client.is_mlx() {
+            chat_request
+                .stop
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .and_then(|stop| ctx.state.tokenizer.as_deref().map(|tok| (stop, tok)))
+                .map(|(stop, tok)| {
+                    let extra_ids = stop_strings_to_token_ids(stop, tok);
+                    let mut req = (*chat_request).clone();
+                    let mut merged = req.stop_token_ids.take().unwrap_or_default();
+                    merged.extend(extra_ids);
+                    req.stop = None;
+                    req.stop_token_ids = if merged.is_empty() { None } else { Some(merged) };
+                    req
+                })
+        } else {
+            None
+        };
+        let chat_request_body: &ChatCompletionRequest =
+            mlx_modified.as_ref().map_or(&*chat_request, |r| r);
+
         // Reject multimodal for backends that don't support it, before assembling
         if processed_messages.multimodal_intermediate.is_some() && builder_client.is_mlx() {
             return Err(error::bad_request(
@@ -91,7 +118,7 @@ impl PipelineStage for ChatRequestBuildingStage {
         let mut proto_request = builder_client
             .build_chat_request(
                 request_id,
-                &chat_request,
+                chat_request_body,
                 processed_messages.text,
                 token_ids,
                 multimodal_data,

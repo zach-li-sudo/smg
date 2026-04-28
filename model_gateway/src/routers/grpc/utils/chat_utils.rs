@@ -17,7 +17,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::routers::{
@@ -419,6 +419,31 @@ pub fn create_stop_decoder(
     builder.build()
 }
 
+/// Tokenizes stop strings into token IDs for the MLX backend.
+/// Only strings that encode to a single token are accepted;
+/// multi-token strings are skipped with a warning.
+pub(crate) fn stop_strings_to_token_ids(
+    stop: &StringOrArray,
+    tokenizer: &dyn Tokenizer,
+) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for s in stop.iter() {
+        match tokenizer.encode(s, false) {
+            Ok(enc) => match enc.token_ids() {
+                [id] => ids.push(*id),
+                tokens if !tokens.is_empty() => warn!(
+                    stop_string = s,
+                    token_count = tokens.len(),
+                    "stop string encodes to multiple tokens; only single-token stops are supported for MLX, skipping",
+                ),
+                _ => {}
+            },
+            Err(e) => warn!(stop_string = s, error = %e, "failed to tokenize stop string for MLX"),
+        }
+    }
+    ids
+}
+
 /// Parse tool calls from JSON schema constrained response
 pub(crate) fn parse_json_schema_response(
     processed_text: &str,
@@ -583,13 +608,68 @@ pub(crate) fn parse_finish_reason(
 #[cfg(test)]
 mod tests {
     use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+    use llm_tokenizer::{Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens, TokenizerTrait};
     use openai_protocol::{
         chat::{ChatMessage, MessageContent},
-        common::{ContentPart, ImageUrl},
+        common::{ContentPart, ImageUrl, StringOrArray},
     };
     use serde_json::json;
 
     use super::*;
+
+    // Minimal tokenizer that always returns an encode error, used to exercise
+    // the Err arm in stop_strings_to_token_ids.
+    struct FailingTokenizer {
+        special_tokens: SpecialTokens,
+    }
+
+    impl FailingTokenizer {
+        fn new() -> Self {
+            Self { special_tokens: SpecialTokens::default() }
+        }
+    }
+
+    impl Encoder for FailingTokenizer {
+        fn encode(&self, _input: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            Err(anyhow::anyhow!("test encode error"))
+        }
+
+        fn encode_batch(
+            &self,
+            _inputs: &[&str],
+            _add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            Err(anyhow::anyhow!("test encode error"))
+        }
+    }
+
+    impl Decoder for FailingTokenizer {
+        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl TokenizerTrait for FailingTokenizer {
+        fn vocab_size(&self) -> usize {
+            0
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.special_tokens
+        }
+
+        fn token_to_id(&self, _token: &str) -> Option<u32> {
+            None
+        }
+
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     #[test]
     fn test_transform_messages_string_format() {
@@ -779,5 +859,68 @@ mod tests {
         assert_eq!(content_array.len(), 2);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    // ── stop_strings_to_token_ids ────────────────────────────────────────
+
+    #[test]
+    fn test_stop_single_token_string() {
+        // "Hello" is in the mock vocab as token 1 — single-token stop accepted.
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::String("Hello".to_string());
+        assert_eq!(stop_strings_to_token_ids(&stop, &tok), vec![1]);
+    }
+
+    #[test]
+    fn test_stop_single_token_special() {
+        // Special tokens like <|im_end|> encode to a single vocab ID (1002).
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::String("<|im_end|>".to_string());
+        assert_eq!(stop_strings_to_token_ids(&stop, &tok), vec![1002]);
+    }
+
+    #[test]
+    fn test_stop_multi_token_skipped() {
+        // "Hello world" → [1, 2] (two tokens) — skipped with a warning, not an error.
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::String("Hello world".to_string());
+        assert!(stop_strings_to_token_ids(&stop, &tok).is_empty());
+    }
+
+    #[test]
+    fn test_stop_unknown_string_skipped() {
+        // A string not in the vocab encodes to an empty slice — silently ignored.
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::String("zzzunknown".to_string());
+        assert!(stop_strings_to_token_ids(&stop, &tok).is_empty());
+    }
+
+    #[test]
+    fn test_stop_array_mixed() {
+        // Array containing: single-token, multi-token (skipped), and unknown (skipped).
+        // Only the single-token entries contribute IDs.
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::Array(vec![
+            "Hello".to_string(),       // token 1  — accepted
+            "Hello world".to_string(), // tokens [1, 2] — skipped
+            "zzzunknown".to_string(),  // empty   — skipped
+            "test".to_string(),        // token 3  — accepted
+        ]);
+        assert_eq!(stop_strings_to_token_ids(&stop, &tok), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_stop_encode_error_skipped() {
+        // When encode returns Err the string is skipped; the function does not panic.
+        let tok = FailingTokenizer::new();
+        let stop = StringOrArray::Array(vec!["Hello".to_string(), "test".to_string()]);
+        assert!(stop_strings_to_token_ids(&stop, &tok).is_empty());
+    }
+
+    #[test]
+    fn test_stop_empty_array() {
+        let tok = MockTokenizer::new();
+        let stop = StringOrArray::Array(vec![]);
+        assert!(stop_strings_to_token_ids(&stop, &tok).is_empty());
     }
 }
